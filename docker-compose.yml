@@ -1,62 +1,49 @@
-version: '3.9'
+version: "3.8"
 
 services:
-
-
-  # Сервис NATS
-  nats:
-    image: nats:2.9.19-alpine
-    container_name: nats
+  db:
+    image: timescale/timescaledb:latest-pg14
+    container_name: infosir_db
+    restart: always
     ports:
-      - "4222:4222"  # основной порт для клиентов (NATS)
-      - "8222:8222"  # HTTP-порт для мониторинга NATS
-    command: -DV # детальный лог (Debug + Verbose), по желанию
-    # Можно добавить переменные окружения NATS, если нужно
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: "infosir_db"
+      POSTGRES_USER: "root"
+      POSTGRES_PASSWORD: "secret"
+    # Optionally mount a volume for persistent storage
+    volumes:
+      - db_data:/var/lib/postgresql/data
 
-  # Сервис InfoSir
+  nats:
+    image: nats:2.9.17-alpine
+    container_name: infosir_nats
+    restart: always
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    command: ["-js"]  # enable JetStream
+
   infosir:
     build: .
-    container_name: infosir
+    container_name: infosir_app
     depends_on:
+      - db
       - nats
-    # Публикуем порт 8080 наружу
+    environment:
+      # We override the config for DB here if needed
+      DB_HOST: "db"
+      DB_PORT: "5432"
+      DB_USER: "root"
+      DB_PASS: "secret"
+      DB_NAME: "infosir_db"
+
+      NATS_URL: "nats://nats:4222"
+      # You may also set KLINES_POINT, BINANCE_BASE_URL, etc.
     ports:
       - "8080:8080"
-    # Пример передачи ENV-переменных (можно также .env файл в корне)
-    environment:
-      # Подключимся к NATS по имени контейнера (nats:4222)
-      NATS_URL: "nats://nats:4222"
-#      NATS_SUBJECT: "infosir_kline"
-#      BINANCE_BASE_URL: "https://api.binance.com"
-#      PAIRS: "BTCUSDT,ETHUSDT"
-#      KLINE_INTERVAL: "1m"
-#      KLINE_LIMIT: "10"
-      HTTP_PORT: "8080"
-      # Можно задать другие переменные
+    # Wait for DB and NATS to be ready if needed; can use a small script or service
+    # For instance, we can rely on some wait-for-it if desired
 
-      # NATS_SUBJECT: "infosir_kline"
-      # BINANCE_BASE_URL: "https://api.binance.com"
-      # Pairs, Interval, и т.д.
-      # Если .env лежит рядом, docker-compose может сам их прочитать.
-
-    # Пример healthcheck, обращается к /healthz
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
-
-  timescaledb:
-    image: timescale/timescaledb:2.11.1-pg15
-    container_name: timescaledb
-    environment:
-      POSTGRES_PASSWORD: mysecret
-      POSTGRES_USER: myuser
-      POSTGRES_DB: mydb
-    ports:
-      - 5432:5432
-    volumes:
-      - timescale_data:/var/lib/postgresql/data
 volumes:
-  timescale_data:
+  db_data:

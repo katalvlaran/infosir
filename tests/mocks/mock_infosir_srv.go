@@ -3,35 +3,38 @@ package mocks
 import (
 	"context"
 
-	"infosir/internal/model"
+	"infosir/internal/models"
+	"infosir/internal/srv"
+
+	"github.com/stretchr/testify/mock"
 )
 
+// Ensure MockInfoSirService implements the InfoSirService interface
+var _ srv.InfoSirService = (*MockInfoSirService)(nil)
+
+// MockInfoSirService is a testify-based mock for the InfoSirService interface.
 type MockInfoSirService struct {
-	GetKlinesFn     func(context.Context, string, string, int64) ([]model.Kline, error)
-	PublishKlinesFn func(context.Context, []model.Kline) error
-
-	CallsGetKlines []struct {
-		Pair, Interval string
-		Limit          int64
-	}
-	CallsPublishKlines []int // or store the actual klines length
+	mock.Mock
 }
 
-func (m *MockInfoSirService) GetKlines(ctx context.Context, pair, interval string, limit int64) ([]model.Kline, error) {
-	m.CallsGetKlines = append(m.CallsGetKlines, struct {
-		Pair, Interval string
-		Limit          int64
-	}{pair, interval, limit})
-	if m.GetKlinesFn != nil {
-		return m.GetKlinesFn(ctx, pair, interval, limit)
-	}
-	return nil, nil
+// GetKlines mocks the retrieval of klines from the underlying binance-like client.
+func (m *MockInfoSirService) GetKlines(
+	ctx context.Context,
+	pair string,
+	interval string,
+	limit int64,
+) ([]models.Kline, error) {
+
+	args := m.Called(ctx, pair, interval, limit)
+	klines, _ := args.Get(0).([]models.Kline)
+	return klines, args.Error(1)
 }
 
-func (m *MockInfoSirService) PublishKlinesJS(ctx context.Context, kl []model.Kline) error {
-	m.CallsPublishKlines = append(m.CallsPublishKlines, len(kl))
-	if m.PublishKlinesFn != nil {
-		return m.PublishKlinesFn(ctx, kl)
-	}
-	return nil
+// PublishKlinesJS mocks the publishing of klines to NATS JetStream.
+func (m *MockInfoSirService) PublishKlinesJS(
+	ctx context.Context,
+	klines []models.Kline,
+) error {
+	args := m.Called(ctx, klines)
+	return args.Error(0)
 }

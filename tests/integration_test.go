@@ -1,73 +1,112 @@
 package tests
 
 import (
-	"bytes"
-	"encoding/json"
+	"context"
+	"database/sql"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
+	"os"
 	"testing"
+	"time"
 
-	"infosir/internal/model"
-	"infosir/pkg/crypto"
+	"infosir/cmd/config"
+	"infosir/internal/db"
+	"infosir/internal/db/repository"
+	"infosir/internal/models"
+	"infosir/internal/utils"
 
+	_ "github.com/lib/pq" // example: if we do a direct DB test
 	"github.com/stretchr/testify/assert"
-
-	"infosir/cmd/handler"
-	"infosir/internal/srv"
-	"infosir/tests/mocks"
 )
 
-// If your main uses a mux or some router, replicate that logic here
-// or if the orchestrator handler is public, you can call it directly.
-
-func TestOrchestratorHandler_Integration(t *testing.T) {
-	// Use mock binance and mock nats for a partial integration test
-	scenarioList := []mocks.Scenario{
-		{
-			Pair: "BTCUSDT", Interval: "1m", Limit: 5,
-			ReturnKlines: []model.Kline{
-				{Time: crypto.MsToTime(1000_000)}, // ...
-			},
-			ReturnError: nil,
-		},
-		{
-			Pair: "BTCUSDT", Interval: "1m", Limit: 10,
-			// допустим хотим вернуть ошибку
-			ReturnKlines: nil,
-			ReturnError:  fmt.Errorf("simulate network fail"),
-		},
+// TestIntegration_DatabaseInsert is a pseudo-integration test that checks if we
+// can actually insert and retrieve klines from a real or test database.
+func TestIntegration_DatabaseInsert(t *testing.T) {
+	// 1. Possibly load config if not already done
+	err := config.LoadConfig()
+	if err != nil {
+		t.Fatalf("Failed to load config: %v", err)
 	}
-	mockBinance := mocks.NewMockBinanceClient(scenarioList)
 
-	scenarios := []mocks.NatsPublishScenario{
-		{Subject: "infosir_kline", ReturnError: nil}, // ok
-		{Subject: "some_other_subject", ReturnError: fmt.Errorf("JS down")},
+	// 2. Initialize logger (or do once in a TestMain)
+	utils.InitLogger()
+
+	// 3. Connect to DB
+	dbPool, err := db.InitDatabase()
+	if err != nil {
+		t.Fatalf("Cannot init DB: %v", err)
 	}
-	mockNats := mocks.NewMockNatsClient(scenarios)
+	defer dbPool.Close()
 
-	logger := testLogger()
-	service := srv.NewInfoSirService(mockBinance, mockNats)
+	// 4. Create the repository
+	kRepo := repository.NewKlineRepository(dbPool)
 
-	// Build a handler with service
-	handlerFn := handler.OrchestratorHandler(service, logger)
+	openTime, err := time.Parse("2006-01-02T15:04:05Z", "2024-01-02T15:04:05Z")
+	if err != nil {
+		t.Fatalf("parse time: %v", err)
+	}
+	// 5. Insert a kline
+	testKline := models.Kline{
+		Symbol:              "TESTPAIR",
+		Time:                openTime,
+		OpenPrice:           123.45,
+		HighPrice:           130.00,
+		LowPrice:            120.11,
+		ClosePrice:          128.00,
+		Volume:              123.456,
+		QuoteVolume:         999.999,
+		Trades:              456,
+		TakerBuyBaseVolume:  50.0,
+		TakerBuyQuoteVolume: 60.0,
+	}
 
-	// Prepare request
-	body := []byte(`{"pair":"BTCUSDT","time":"1m","klines":3}`)
-	req := httptest.NewRequest(http.MethodPost, "/orchestrator/fetch", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
+	ctx := context.Background()
+	err = kRepo.InsertKline(ctx, testKline)
+	assert.NoError(t, err, "InsertKline should succeed")
 
-	// record response
-	w := httptest.NewRecorder()
-	handlerFn(w, req)
-
-	resp := w.Result()
-	assert.Equal(t, http.StatusOK, resp.StatusCode)
-
-	// check body
-	var result map[string]string
-	json.NewDecoder(resp.Body).Decode(&result)
-	assert.Equal(t, "ok", result["status"], "Expected JSON {status: ok}")
+	// 6. Retrieve the last kline for "TESTPAIR"
+	retrieved, err := kRepo.FindLast(ctx, "testpair") // note the lowercase, if you store symbol in lower
+	assert.NoError(t, err, "FindLast should succeed")
+	assert.Equal(t, testKline.ClosePrice, retrieved.ClosePrice, "ClosePrice mismatch")
+	assert.Equal(t, testKline.Trades, retrieved.Trades, "Trades mismatch")
 }
 
-// If you prefer a more thorough approach, spin up an actual server and call it via net/http.
+// TestIntegration_Connection ensures DB migrations are done properly
+func TestIntegration_Connection(t *testing.T) {
+	// Possibly you want to check that the table "futures_klines" is created, etc.
+	dsn := fmt.Sprintf(
+		"postgres://%s:%s@%s:%d/%s?sslmode=disable",
+		config.Cfg.Database.User,
+		config.Cfg.Database.Password,
+		config.Cfg.Database.Host,
+		config.Cfg.Database.Port,
+		config.Cfg.Database.Name,
+	)
+
+	dbConn, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("Failed to open raw DB conn: %v", err)
+	}
+	defer dbConn.Close()
+
+	// ping
+	err = dbConn.Ping()
+	assert.NoError(t, err, "Ping to DB should succeed")
+
+	// check if table "futures_klines" exists
+	var tableName string
+	err = dbConn.QueryRow(`
+		SELECT tablename
+		FROM pg_catalog.pg_tables
+		WHERE tablename = 'futures_klines';
+	`).Scan(&tableName)
+
+	assert.NoError(t, err, "Should find futures_klines in pg_tables")
+	assert.Equal(t, "futures_klines", tableName, "Table name mismatch")
+}
+
+// Optionally we can define a TestMain() for integration tests set up
+func TestMain(m *testing.M) {
+	// e.g. do some start up or docker container management
+	code := m.Run()
+	os.Exit(code)
+}

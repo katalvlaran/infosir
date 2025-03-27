@@ -8,211 +8,156 @@ import (
 	"strconv"
 	"time"
 
-	"infosir/cmd/config"
-	"infosir/internal/model"
+	"infosir/internal/models"
+	"infosir/internal/utils"
+
+	"go.uber.org/zap"
 )
 
-// BinanceClient определяет методы для работы с публичными эндпоинтами Binance
-type BinanceClient interface {
-	FetchKlines(ctx context.Context, pair string, interval string, limit int64) ([]model.Kline, error)
-	FetchKlinesRange(ctx context.Context, pair, interval string, startTime, endTime int64, limit int64) ([]model.Kline, error)
-}
-
-// binanceClientImpl — реализация интерфейса BinanceClient
+// binanceClientImpl is a concrete implementation of a Binance-like client.
 type binanceClientImpl struct {
-	baseURL    string
-	klinePoint string
 	httpClient *http.Client
+	baseURL    string
+	klinesPath string
 }
 
-// NewBinanceClient — конструктор, принимающий базовый URL (например, "https://api.binance.com")
-// и создающий http.Client с дефолтным таймаутом (можно расширить при необходимости).
-func NewBinanceClient() BinanceClient {
+// NewBinanceClient constructs a new Binance-like client using default baseURL and path from config.
+func NewBinanceClient() *binanceClientImpl {
+	cfg := utils.GetConfig().Crypto
+
 	return &binanceClientImpl{
-		baseURL:    config.Cfg.Crypto.BinanceBaseURL,
-		klinePoint: config.Cfg.Crypto.BinanceKlinesPoint,
 		httpClient: &http.Client{
-			Timeout: 10 * time.Second, // Подходящий таймаут
+			Timeout: 10 * time.Second,
 		},
+		baseURL:    cfg.BinanceBaseURL,
+		klinesPath: cfg.BinanceKlinesPoint,
 	}
 }
 
-// FetchKlines отправляет GET-запрос на /fapi/v1/klines?symbol=...&interval=...&limit=...
-// и формирует массив []model.Kline. Возвращает ошибку при недоступности сети/неправильном ответе.
-func (b *binanceClientImpl) FetchKlines(ctx context.Context, pair string, interval string, limit int64) ([]model.Kline, error) {
-	url := fmt.Sprintf("%s%s?symbol=%s&interval=%s&limit=%d",
-		b.baseURL, b.klinePoint, pair, interval, limit)
+// FetchKlines retrieves up to 'limit' klines for the given trading pair and interval from the Binance API.
+// The returned slice of model.Kline is in ascending time order.
+func (b *binanceClientImpl) FetchKlines(
+	ctx context.Context,
+	pair, interval string,
+	limit int64,
+) ([]models.Kline, error) {
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	endpoint := fmt.Sprintf(
+		"%s/%s?symbol=%s&interval=%s&limit=%d",
+		b.baseURL,
+		b.klinesPath,
+		pair,
+		interval,
+		limit,
+	)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return nil, fmt.Errorf("failed to create new request: %w", err)
 	}
 
 	resp, err := b.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to do request to binance: %w", err)
+		return nil, fmt.Errorf("httpClient.Do error: %w", err)
 	}
 	defer resp.Body.Close()
 
-	// Проверяем статус ответа (ожидаем 200)
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("binance API returned non-200 status: %d", resp.StatusCode)
+		return nil, fmt.Errorf("fetchKlines received status %d from binance", resp.StatusCode)
 	}
 
-	// Парсим тело ответа
-	// Пример структуры ответа: [][]interface{}
-	// Нам нужны поля:
-	//  [0] -> time (int64)
-	//  [1] -> symbol (string -> float64)
-	//  [2] -> open (string -> float64)
-	//  [3] -> high (string -> float64)
-	//  [4] -> low (string -> float64)
-	//  [5] -> close (string -> float64)
-	//  [6] -> volume (int64)
-	//  [7] -> quote_volume (float64)
-	//  [8] -> trades (int64)
-	//  [9] -> taker_buy_base_volume (float64)
-	//  [10] -> taker_buy_quote_volume (float64)
+	// Binance returns klines as an array of arrays:
+	// e.g. [
+	//   [ 1499040000000, "0.01634790", "0.80000000", "0.01575800", "0.01577100", "148976.11427815", ... ],
+	//   ...
+	// ]
+	// We'll parse them accordingly.
 	var rawKlines [][]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&rawKlines); err != nil {
-		return nil, fmt.Errorf("failed to decode binance klines: %w", err)
+		return nil, fmt.Errorf("failed to decode binance klines JSON: %w", err)
 	}
 
-	klines := make([]model.Kline, 0, len(rawKlines))
-	for _, item := range rawKlines {
-		// Проверяем длину массива item
-		if len(item) < 7 {
-			continue // некорректный формат
+	klines := make([]models.Kline, 0, len(rawKlines))
+
+	for _, raw := range rawKlines {
+		// We expect each raw to have length >= 11, e.g. openTime, openPrice, highPrice, lowPrice, closePrice, volume ...
+		// For reference, see Binance docs for the full structure
+		if len(raw) < 11 {
+			utils.Logger.Warn("Skipping malformed kline record", zap.Any("raw", raw))
+			continue
 		}
 
-		time, _ := toInt64(item[0])
-		symbol, _ := toString(item[1])
-		openP, _ := toFloat64(item[2])
-		highP, _ := toFloat64(item[3])
-		lowP, _ := toFloat64(item[4])
-		closeP, _ := toFloat64(item[5])
-		volume, _ := toFloat64(item[6])
-		quote_volume, _ := toFloat64(item[7])
-		trades, _ := toInt64(item[8])
-		taker_buy_base_volume, _ := toFloat64(item[9])
-		taker_buy_quote_volume, _ := toFloat64(item[10])
+		openTimeMs, _ := toInt64(raw[0])
+		openStr, _ := toString(raw[1])
+		highStr, _ := toString(raw[2])
+		lowStr, _ := toString(raw[3])
+		closeStr, _ := toString(raw[4])
+		volStr, _ := toString(raw[5])
+		// index 6 is quote volume
+		quoteVolStr, _ := toString(raw[7])
+		tradesCount, _ := toInt64(raw[8])
+		takerBuyBaseStr, _ := toString(raw[9])
+		takerBuyQuoteStr, _ := toString(raw[10])
 
-		k := model.Kline{
-			Time:                MsToTime(time),
-			Symbol:              symbol,
-			OpenPrice:           openP,
-			HighPrice:           highP,
-			LowPrice:            lowP,
-			ClosePrice:          closeP,
-			Volume:              volume,
-			QuoteVolume:         quote_volume,
-			Trades:              trades,
-			TakerBuyBaseVolume:  taker_buy_base_volume,
-			TakerBuyQuoteVolume: taker_buy_quote_volume,
+		// Convert strings to float64
+		openF, _ := strconv.ParseFloat(openStr, 64)
+		highF, _ := strconv.ParseFloat(highStr, 64)
+		lowF, _ := strconv.ParseFloat(lowStr, 64)
+		closeF, _ := strconv.ParseFloat(closeStr, 64)
+		volF, _ := strconv.ParseFloat(volStr, 64)
+		quoteVolF, _ := strconv.ParseFloat(quoteVolStr, 64)
+		takerBuyBaseF, _ := strconv.ParseFloat(takerBuyBaseStr, 64)
+		takerBuyQuoteF, _ := strconv.ParseFloat(takerBuyQuoteStr, 64)
+
+		openTime := time.Unix(0, openTimeMs*int64(time.Millisecond))
+
+		k := models.Kline{
+			Time:                openTime,
+			Symbol:              pair, // we store the exact pair as given
+			OpenPrice:           openF,
+			HighPrice:           highF,
+			LowPrice:            lowF,
+			ClosePrice:          closeF,
+			Volume:              volF,
+			QuoteVolume:         quoteVolF,
+			Trades:              tradesCount,
+			TakerBuyBaseVolume:  takerBuyBaseF,
+			TakerBuyQuoteVolume: takerBuyQuoteF,
 		}
 		klines = append(klines, k)
 	}
 
-	return klines, nil
-}
-
-func (b *binanceClientImpl) FetchKlinesRange(ctx context.Context, pair, interval string, startTime, endTime int64, limit int64) ([]model.Kline, error) {
-	url := fmt.Sprintf("%s%s?symbol=%s&interval=%s&startTime=%d&endTime=%d&limit=%d",
-		b.baseURL, b.klinePoint, pair, interval, startTime, endTime, limit)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	resp, err := b.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to do request to binance: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("binance API returned non-200: %d", resp.StatusCode)
-	}
-
-	var rawKlines [][]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&rawKlines); err != nil {
-		return nil, fmt.Errorf("failed to decode binance klines: %w", err)
-	}
-
-	klines := make([]model.Kline, 0, len(rawKlines))
-	for _, item := range rawKlines {
-		if len(item) < 7 {
-			continue
-		}
-		time, _ := toInt64(item[0])
-		symbol, _ := toString(item[1])
-		openP, _ := toFloat64(item[2])
-		highP, _ := toFloat64(item[3])
-		lowP, _ := toFloat64(item[4])
-		closeP, _ := toFloat64(item[5])
-		volume, _ := toFloat64(item[6])
-		quote_volume, _ := toFloat64(item[7])
-		trades, _ := toInt64(item[8])
-		taker_buy_base_volume, _ := toFloat64(item[9])
-		taker_buy_quote_volume, _ := toFloat64(item[10])
-
-		klines = append(klines, model.Kline{
-			Time:                MsToTime(time),
-			Symbol:              symbol,
-			OpenPrice:           openP,
-			HighPrice:           highP,
-			LowPrice:            lowP,
-			ClosePrice:          closeP,
-			Volume:              volume,
-			QuoteVolume:         quote_volume,
-			Trades:              trades,
-			TakerBuyBaseVolume:  taker_buy_base_volume,
-			TakerBuyQuoteVolume: taker_buy_quote_volume,
-		})
-	}
+	utils.Logger.Debug("Fetched klines from binance",
+		zap.String("pair", pair),
+		zap.Int("count", len(klines)),
+	)
 
 	return klines, nil
 }
 
-// toInt64 пытается преобразовать значение из JSON (float64, string, int) к int64.
-func toInt64(v interface{}) (int64, error) {
+func toInt64(v interface{}) (int64, bool) {
 	switch val := v.(type) {
 	case float64:
-		return int64(val), nil
-	case string:
-		return strconv.ParseInt(val, 10, 64)
+		return int64(val), true
+	case float32:
+		return int64(val), true
 	case int:
-		return int64(val), nil
+		return int64(val), true
+	case int64:
+		return val, true
+	case string:
+		res, err := strconv.ParseInt(val, 10, 64)
+		return res, (err == nil)
 	default:
-		return 0, fmt.Errorf("unexpected type for int64 conversion: %T", v)
+		return 0, false
 	}
 }
 
-// toFloat64 пытается преобразовать значение из JSON (float64, string, int) к float64.
-func toFloat64(v interface{}) (float64, error) {
-	switch val := v.(type) {
-	case float64:
-		return val, nil
-	case string:
-		return strconv.ParseFloat(val, 64)
-	case int:
-		return float64(val), nil
-	default:
-		return 0, fmt.Errorf("unexpected type for float64 conversion: %T", v)
-	}
-}
-
-// toString пытается преобразовать значение из JSON (float64, string, int) к string.
-func toString(v interface{}) (string, error) {
+func toString(v interface{}) (string, bool) {
 	switch val := v.(type) {
 	case string:
-		return val, nil
+		return val, true
 	default:
-		return "", fmt.Errorf("unexpected type for float64 conversion: %T", v)
+		return fmt.Sprintf("%v", v), true
 	}
-}
-
-func MsToTime(ms int64) time.Time {
-	return time.Unix(ms/1000, (ms%1000)*1_000_000).UTC()
 }

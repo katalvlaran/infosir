@@ -1,78 +1,33 @@
-// tests/mocks/mock_kline_repo.go
-
 package mocks
 
 import (
 	"context"
-	"fmt"
 
-	"infosir/internal/model"
+	"infosir/internal/models"
+
+	"github.com/stretchr/testify/mock"
 )
 
-type FindLastScenario struct {
-	TableName   string
-	ReturnKline model.Kline
-	ReturnError error
-}
-
-type BatchInsertScenario struct {
-	TableName    string
-	KlinesToFail bool // or ReturnError error
-}
-
+// MockKlineRepository is a testify-based mock for a repository that stores klines.
 type MockKlineRepository struct {
-	FindLastScenarios    []FindLastScenario
-	BatchInsertScenarios []BatchInsertScenario
-
-	FindLastCalls    []string // track tableName
-	BatchInsertCalls []struct {
-		TableName string
-		Count     int
-	}
+	mock.Mock
 }
 
-func NewMockKlineRepository(flScn []FindLastScenario, biScn []BatchInsertScenario) *MockKlineRepository {
-	return &MockKlineRepository{
-		FindLastScenarios:    flScn,
-		BatchInsertScenarios: biScn,
-	}
+// InsertKline mocks inserting a single Kline.
+func (m *MockKlineRepository) InsertKline(ctx context.Context, k models.Kline) error {
+	args := m.Called(ctx, k)
+	return args.Error(0)
 }
 
-func (m *MockKlineRepository) FindLast(ctx context.Context, tableName string) (model.Kline, error) {
-	// log
-	m.FindLastCalls = append(m.FindLastCalls, tableName)
-	// find scenario
-	for _, sc := range m.FindLastScenarios {
-		if sc.TableName == tableName {
-			return sc.ReturnKline, sc.ReturnError
-		}
-	}
-	return model.Kline{}, fmt.Errorf("no scenario found for table=%s", tableName)
+// BatchInsertKlines mocks inserting multiple klines in one batch.
+func (m *MockKlineRepository) BatchInsertKlines(ctx context.Context, klines []models.Kline) error {
+	args := m.Called(ctx, klines)
+	return args.Error(0)
 }
 
-func (m *MockKlineRepository) BatchInsertKline(ctx context.Context, tableName string, klines []model.Kline) error {
-	m.BatchInsertCalls = append(m.BatchInsertCalls, struct {
-		TableName string
-		Count     int
-	}{tableName, len(klines)})
-
-	// find scenario
-	for _, sc := range m.BatchInsertScenarios {
-		if sc.TableName == tableName {
-			// if sc.KlinesToFail => return error
-			if sc.KlinesToFail {
-				return fmt.Errorf("forced error in BatchInsert for table %s", tableName)
-			}
-			// else success
-		}
-	}
-	return nil
+// FindLast mocks retrieving the most recent Kline for the given symbol.
+func (m *MockKlineRepository) FindLast(ctx context.Context, symbol string) (models.Kline, error) {
+	args := m.Called(ctx, symbol)
+	k, _ := args.Get(0).(models.Kline)
+	return k, args.Error(1)
 }
-
-/*
-// optionally implement other methods if needed
-func (m *MockKlineRepository) FindMany(...) ([]model.Kline, error) {
-	// ...
-	return nil, nil
-}
-*/

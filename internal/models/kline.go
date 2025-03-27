@@ -1,4 +1,4 @@
-package model
+package models
 
 import (
 	"time"
@@ -6,7 +6,19 @@ import (
 	validation "github.com/go-ozzo/ozzo-validation"
 )
 
-// Kline описывает одну свечу (FuturesKline) для криптопары на бирже Binance
+// Kline represents a single candlestick (OHLCV) data point for a given symbol
+// at a specific timestamp. These are typically retrieved from Binance or
+// another exchange, then stored in TimescaleDB.
+//
+// Fields:
+//   - Time: The timestamp associated with this kline (UTC).
+//   - Symbol: The trading pair, e.g. "BTCUSDT".
+//   - OpenPrice, HighPrice, LowPrice, ClosePrice: Standard OHLC values.
+//   - Volume: The base asset volume in this interval.
+//   - QuoteVolume: The quote asset volume in this interval.
+//   - Trades: The number of trades during this interval.
+//   - TakerBuyBaseVolume: The base volume where takers were the buyers.
+//   - TakerBuyQuoteVolume: The quote volume where takers were the buyers.
 type Kline struct {
 	Time                time.Time `json:"time"`
 	Symbol              string    `json:"symbol"`
@@ -21,7 +33,8 @@ type Kline struct {
 	TakerBuyQuoteVolume float64   `json:"taker_buy_quote_volume"`
 }
 
-// Validate проверяет корректность данных внутри Kline.
+// Validate checks if the Kline struct fields are within acceptable ranges
+// (e.g., no negative prices or volumes). If anything is invalid, returns an error.
 func (k Kline) Validate() error {
 	return validation.ValidateStruct(&k,
 		validation.Field(&k.Time, validation.Required),

@@ -1,37 +1,33 @@
-# Используем официальный образ Go для сборки (stage 1)
 FROM golang:1.23-alpine AS builder
 LABEL authors="katalvlaran"
 WORKDIR /app
 
-# Скопируем go.mod и go.sum сначала, чтобы закешировать скачивание модулей
+# Copy go.mod and go.sum first to take advantage of layer caching
 COPY go.mod go.sum ./
+
+# Download modules
 RUN go mod download
 
-# Копируем весь оставшийся код
+# Copy everything else
 COPY . .
 
-# Собираем бинарник
-RUN go build -o /infoSir cmd/main.go
+# Build the binary
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o infosir ./cmd/main.go
 
-# --- Минимизируем финальный образ (stage 2) ---
+# Final stage
 FROM alpine:3.17
-
-# Создадим непривилегированного пользователя (для безопасности)
-RUN addgroup -S infosir && adduser -S infosir -G infosir
-
 WORKDIR /app
 
-# Копируем собранный бинарник и .env (если хотите внутри контейнера)
-COPY --from=builder /infoSir /app/
+# Copy the compiled binary, migrations and .env
+COPY --from=builder /app/infosir /app/infosir
+COPY --from=builder /app/internal/db/migrations /app/migrations
 COPY .env /app/.env
 
-# Меняем владельца, чтобы запустить под пользователем
-RUN chown -R infosir:infosir /app
-
-USER infosir
-
-# Пробрасываем порт 8080 для веб-сервера
+# Expose the configured port, default 8080
 EXPOSE 8080
 
-# Запускаем бинарник
-CMD ["/app/infoSir"]
+# Set working directory explicitly (important!)
+WORKDIR /app
+
+# Default entrypoint
+ENTRYPOINT ["/app/infosir"]
