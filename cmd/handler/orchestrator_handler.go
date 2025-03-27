@@ -1,11 +1,10 @@
 package handler
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 
-	"infosir/internal/model"
+	"infosir/internal/srv"
 
 	"go.uber.org/zap"
 )
@@ -17,17 +16,9 @@ type OrchestratorRequest struct {
 	Klines int64  `json:"klines"`
 }
 
-// InfoSirService — временный интерфейс-заглушка, чтобы показать,
-// как мы будем вызывать методы из service.go (Шаг 6).
-// Когда реализуем реальный сервис, нужно будет подключить его сюда.
-type InfoSirService interface {
-	GetKlines(reqCtx context.Context, pair string, interval string, limit int64) ([]model.Kline, error)
-	PublishKlines(reqCtx context.Context, klines []model.Kline) error
-}
-
-// OrchestratorHandler возвращает http.HandlerFunc, который обрабатывает запрос от оркестратора.
-// Когда появится реальный InfoSirService, заменим аргумент service на настоящий.
-func OrchestratorHandler(service InfoSirService, logger *zap.Logger) http.HandlerFunc {
+// OrchestratorRequest holds the request payload from an orchestrator
+// for fetching & publishing klines.
+func OrchestratorHandler(service srv.InfoSirService, logger *zap.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
@@ -61,7 +52,7 @@ func OrchestratorHandler(service InfoSirService, logger *zap.Logger) http.Handle
 			}
 
 			// Затем публикуем результат в NATS
-			if err := service.PublishKlines(r.Context(), klines); err != nil {
+			if err := service.PublishKlinesJS(r.Context(), klines); err != nil {
 				logger.Error("Failed to publish klines", zap.Error(err))
 				http.Error(w, "Failed to publish klines", http.StatusInternalServerError)
 				return

@@ -1,29 +1,49 @@
 package mocks
 
-import (
-	"fmt"
-)
-
-// Suppose your natsClient is something like:
-// type NatsClient interface {
-//     Publish(subject string, data []byte) error
-// }
-
-// We'll define a mock:
-
-type MockNatsClient struct {
-	PublishFn func(subject string, data []byte) error
+type NatsPublishScenario struct {
+	Subject     string
+	ReturnError error
 }
 
-func (m *MockNatsClient) Publish(subject string, data []byte) error {
-	if m.PublishFn != nil {
-		return m.PublishFn(subject, data)
+type MockNatsClient struct {
+	// Можем хранить сценарии, как в случае с Binance
+	PublishScenarios []NatsPublishScenario
+
+	PublishCalls []struct {
+		Subject string
+		Data    []byte
 	}
-	// default - do nothing
-	fmt.Printf("MockNATS Publish to subject=%s data=%s\n", subject, string(data))
+}
+
+func NewMockNatsClient(scenarios []NatsPublishScenario) *MockNatsClient {
+	return &MockNatsClient{PublishScenarios: scenarios}
+}
+
+func (m *MockNatsClient) PublishJS(subject string, data []byte) error {
+	// Логируем вызов
+	m.PublishCalls = append(m.PublishCalls, struct {
+		Subject string
+		Data    []byte
+	}{subject, data})
+
+	// Ищем подходящий сценарий
+	for _, sc := range m.PublishScenarios {
+		if sc.Subject == subject {
+			return sc.ReturnError
+		}
+	}
+
+	// Если нет подходящего сценария, возвращаем nil (по умолчанию)
 	return nil
 }
 
-func NewMockNatsClient() *MockNatsClient {
-	return &MockNatsClient{}
+/*
+scenarios := []mocks.NatsPublishScenario{
+    {Subject: "infosir_kline", ReturnError: nil}, // ok
+    {Subject: "some_other_subject", ReturnError: fmt.Errorf("JS down")},
 }
+mockNats := mocks.NewMockNatsClient(scenarios)
+
+// ... pass this mock to your service ...
+
+*/

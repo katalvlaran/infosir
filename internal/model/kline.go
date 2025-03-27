@@ -1,34 +1,39 @@
 package model
 
 import (
+	"time"
+
 	validation "github.com/go-ozzo/ozzo-validation"
 )
 
-// Kline описывает одну свечу (candlestick) для криптопары на бирже Binance
+// Kline описывает одну свечу (FuturesKline) для криптопары на бирже Binance
 type Kline struct {
-	OpenTime  int64   `json:"openTime"`
-	Open      float64 `json:"open"`
-	High      float64 `json:"high"`
-	Low       float64 `json:"low"`
-	Close     float64 `json:"close"`
-	Volume    float64 `json:"volume"`
-	CloseTime int64   `json:"closeTime"`
+	Time                time.Time `json:"time"`
+	Symbol              string    `json:"symbol"`
+	OpenPrice           float64   `json:"open"`
+	HighPrice           float64   `json:"high"`
+	LowPrice            float64   `json:"low"`
+	ClosePrice          float64   `json:"close"`
+	Volume              float64   `json:"volume"`
+	QuoteVolume         float64   `json:"quote_volume"`
+	Trades              int64     `json:"trades"`
+	TakerBuyBaseVolume  float64   `json:"taker_buy_base_volume"`
+	TakerBuyQuoteVolume float64   `json:"taker_buy_quote_volume"`
 }
 
 // Validate проверяет корректность данных внутри Kline.
-// Здесь можно задать минимальные значения или логику,
-// чтобы Open ≤ High ≥ Low ≤ Close, и т.д., если нужно.
 func (k Kline) Validate() error {
 	return validation.ValidateStruct(&k,
-		// open, high, low, close, volume не должны быть отрицательными
-		validation.Field(&k.Open, validation.Required, validation.Min(0.0)),
-		validation.Field(&k.High, validation.Required, validation.Min(0.0)),
-		validation.Field(&k.Low, validation.Required, validation.Min(0.0)),
-		validation.Field(&k.Close, validation.Required, validation.Min(0.0)),
+		validation.Field(&k.Time, validation.Required),
+		validation.Field(&k.Symbol, validation.Required),
+		validation.Field(&k.OpenPrice, validation.Required, validation.Min(0.0)),
+		validation.Field(&k.HighPrice, validation.Required, validation.Min(0.0)),
+		validation.Field(&k.LowPrice, validation.Required, validation.Min(0.0)),
+		validation.Field(&k.ClosePrice, validation.Required, validation.Min(0.0)),
 		validation.Field(&k.Volume, validation.Required, validation.Min(0.0)),
-
-		// time поля могут быть в миллисекундах (Binance), > 0
-		validation.Field(&k.OpenTime, validation.Min(1)),
-		validation.Field(&k.CloseTime, validation.Min(1)),
+		validation.Field(&k.QuoteVolume, validation.Required, validation.Min(0.0)),
+		validation.Field(&k.Trades, validation.Required, validation.Min(1)),
+		validation.Field(&k.TakerBuyBaseVolume, validation.Required, validation.Min(0.0)),
+		validation.Field(&k.TakerBuyQuoteVolume, validation.Required, validation.Min(0.0)),
 	)
 }

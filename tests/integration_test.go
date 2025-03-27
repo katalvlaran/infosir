@@ -3,9 +3,13 @@ package tests
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"infosir/internal/model"
+	"infosir/pkg/crypto"
 
 	"github.com/stretchr/testify/assert"
 
@@ -19,11 +23,31 @@ import (
 
 func TestOrchestratorHandler_Integration(t *testing.T) {
 	// Use mock binance and mock nats for a partial integration test
-	mockBinance := mocks.NewMockBinanceClient()
-	mockNats := mocks.NewMockNatsClient()
+	scenarioList := []mocks.Scenario{
+		{
+			Pair: "BTCUSDT", Interval: "1m", Limit: 5,
+			ReturnKlines: []model.Kline{
+				{Time: crypto.MsToTime(1000_000)}, // ...
+			},
+			ReturnError: nil,
+		},
+		{
+			Pair: "BTCUSDT", Interval: "1m", Limit: 10,
+			// допустим хотим вернуть ошибку
+			ReturnKlines: nil,
+			ReturnError:  fmt.Errorf("simulate network fail"),
+		},
+	}
+	mockBinance := mocks.NewMockBinanceClient(scenarioList)
+
+	scenarios := []mocks.NatsPublishScenario{
+		{Subject: "infosir_kline", ReturnError: nil}, // ok
+		{Subject: "some_other_subject", ReturnError: fmt.Errorf("JS down")},
+	}
+	mockNats := mocks.NewMockNatsClient(scenarios)
 
 	logger := testLogger()
-	service := srv.NewInfoSirService(logger, testConfig, mockBinance, mockNats)
+	service := srv.NewInfoSirService(mockBinance, mockNats)
 
 	// Build a handler with service
 	handlerFn := handler.OrchestratorHandler(service, logger)

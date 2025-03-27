@@ -1,27 +1,35 @@
 package natsinfosir
 
 import (
+	"fmt"
+
 	"github.com/nats-io/nats.go"
 )
 
-// NatsClient определяет методы для отправки сообщений в NATS.
-// При необходимости можно добавить методы подписки (Subscribe).
+// NatsClient — временный или будущий интерфейс, который будет находиться в pkg/nats (Шаг 9).
+// Сигнатура PublishJS(subject string, data []byte) error
 type NatsClient interface {
-	Publish(subject string, data []byte) error
+	PublishJS(subject string, data []byte) error
 }
 
-// natsClientImpl — реализация NatsClient
-type natsClientImpl struct {
-	conn *nats.Conn
+type natsJetStreamClientImpl struct {
+	js nats.JetStreamContext
 }
 
-// NewNatsClient — конструктор, принимает *nats.Conn (инициализированное в main.go)
-func NewNatsClient(conn *nats.Conn) NatsClient {
-	return &natsClientImpl{conn: conn}
+func NewNatsJetStreamClient(js nats.JetStreamContext) NatsClient {
+	return &natsJetStreamClientImpl{js: js}
 }
 
-// Publish отправляет data в указанную тему (subject) NATS.
-// При ошибке возвращает error.
-func (n *natsClientImpl) Publish(subject string, data []byte) error {
-	return n.conn.Publish(subject, data)
+func (n *natsJetStreamClientImpl) PublishJS(subject string, data []byte) error {
+	// do up to 3 attempts
+	maxAttempts := 3
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		_, err := n.js.Publish(subject, data)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+	}
+	return fmt.Errorf("JetStream publish failed after 3 attempts: %w", lastErr)
 }

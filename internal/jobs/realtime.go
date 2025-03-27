@@ -4,6 +4,8 @@ import (
 	"context"
 	"time"
 
+	"infosir/internal/util"
+
 	"go.uber.org/zap"
 
 	"infosir/cmd/config"
@@ -13,11 +15,11 @@ import (
 // RunScheduledRequests запускает планировщик, который каждые 1 (или N) минут
 // вызывает service.GetKlines() и service.PublishKlines() по каждому инструменту из cfg.Pairs.
 // Вызывается из main.go в отдельной горутине.
-func RunScheduledRequests(ctx context.Context, logger *zap.Logger, cfg *config.Config, service srv.InfoSirService) {
-	ticker := time.NewTicker(1 * time.Minute) // каждые 60 секунд
+func RunScheduledRequests(ctx context.Context, service srv.InfoSirService, interval time.Duration) {
+	ticker := time.NewTicker(interval) // каждые 60 секунд
 	defer ticker.Stop()
 
-	logger.Info("Scheduled job started",
+	util.Logger.Info("Scheduled job started",
 		zap.Duration("interval", 1*time.Minute),
 	)
 
@@ -25,24 +27,24 @@ func RunScheduledRequests(ctx context.Context, logger *zap.Logger, cfg *config.C
 		select {
 		case <-ticker.C:
 			// Для каждой пары в cfg.Pairs получаем свечи и публикуем их
-			for _, pair := range cfg.Pairs {
-				klines, err := service.GetKlines(ctx, pair, cfg.KlineInterval, int64(cfg.KlineLimit))
+			for _, pair := range config.Cfg.Crypto.Pairs {
+				klines, err := service.GetKlines(ctx, pair, config.Cfg.Crypto.KlineInterval, int64(config.Cfg.Crypto.KlineLimit))
 				if err != nil {
-					logger.Error("Failed to get klines from Binance",
+					util.Logger.Error("Failed to get klines from Binance",
 						zap.String("pair", pair),
 						zap.Error(err),
 					)
 					continue
 				}
-				err = service.PublishKlines(ctx, klines)
+				err = service.PublishKlinesJS(ctx, klines)
 				if err != nil {
-					logger.Error("Failed to publish klines to NATS",
+					util.Logger.Error("Failed to publish klines to NATS",
 						zap.String("pair", pair),
 						zap.Error(err),
 					)
 					continue
 				}
-				logger.Debug("Successfully fetched & published klines",
+				util.Logger.Debug("Successfully fetched & published klines",
 					zap.String("pair", pair),
 					zap.Int("klinesCount", len(klines)),
 				)
@@ -50,7 +52,7 @@ func RunScheduledRequests(ctx context.Context, logger *zap.Logger, cfg *config.C
 
 		case <-ctx.Done():
 			// Контекст завершён (graceful shutdown) — выходим
-			logger.Info("Scheduled job received stop signal")
+			util.Logger.Info("Scheduled job received stop signal")
 			return
 		}
 	}

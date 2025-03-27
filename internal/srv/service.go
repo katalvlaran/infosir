@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"infosir/internal/util"
+	natsinfosir "infosir/pkg/nats"
+
 	"go.uber.org/zap"
 
 	"infosir/cmd/config"
@@ -15,44 +18,38 @@ import (
 // Сигнатура FetchKlines(...) должна возвращать []model.Kline, error.
 type BinanceClient interface {
 	FetchKlines(ctx context.Context, pair string, interval string, limit int64) ([]model.Kline, error)
-}
-
-// NatsClient — временный или будущий интерфейс, который будет находиться в pkg/nats (Шаг 9).
-// Сигнатура Publish(subject string, data []byte) error
-type NatsClient interface {
-	Publish(subject string, data []byte) error
+	FetchKlinesRange(ctx context.Context, pair, interval string, startTime, endTime int64, limit int64) ([]model.Kline, error)
 }
 
 // InfoSirService — основной интерфейс сервиса. Методы:
 // 1) GetKlines: запросить свечи у Binance
-// 2) PublishKlines: отправить свечи в очередь NATS
+// 2) PublishKlinesJS: отправить свечи в NATS JetStream
+// InfoSirService — методы
 type InfoSirService interface {
 	GetKlines(ctx context.Context, pair string, interval string, limit int64) ([]model.Kline, error)
-	PublishKlines(ctx context.Context, klines []model.Kline) error
+	PublishKlinesJS(ctx context.Context, klines []model.Kline) error
 }
 
 // infoSirServiceImpl — структура с зависимостями:
 // - logger для логирования
 // - cfg для конфигурации (NATS_SUBJECT, лимиты и т.д.)
 // - binanceClient (реализуется в pkg/crypto/binance.go)
-// - natsClient (реализуется в pkg/nats/nats_infosir.go)
+// - natsClient (new NatsClient that supports PublishJS, реализуется в pkg/nats/nats_infosir.go)
 type infoSirServiceImpl struct {
 	logger        *zap.Logger
 	cfg           *config.Config
 	binanceClient BinanceClient
-	natsClient    NatsClient
+	natsClient    natsinfosir.NatsClient
 }
 
 // NewInfoSirService — конструктор, принимает все необходимые зависимости.
 func NewInfoSirService(
-	logger *zap.Logger,
-	cfg *config.Config,
 	binanceClient BinanceClient,
-	natsClient NatsClient,
+	natsClient natsinfosir.NatsClient,
 ) InfoSirService {
 	return &infoSirServiceImpl{
-		logger:        logger,
-		cfg:           cfg,
+		logger:        util.Logger,
+		cfg:           &config.Cfg,
 		binanceClient: binanceClient,
 		natsClient:    natsClient,
 	}
@@ -99,32 +96,13 @@ func (s *infoSirServiceImpl) GetKlines(ctx context.Context, pair string, interva
 	return result, nil
 }
 
-// PublishKlines — сериализует свечи в JSON и отправляет в NATS.
-// Для этого использует natsClient.Publish().
-func (s *infoSirServiceImpl) PublishKlines(ctx context.Context, klines []model.Kline) error {
+// In the PublishKlines step:
+func (s *infoSirServiceImpl) PublishKlinesJS(ctx context.Context, klines []model.Kline) error {
 	data, err := json.Marshal(klines)
 	if err != nil {
-		s.logger.Error("Failed to marshal klines to JSON", zap.Error(err))
-		return fmt.Errorf("could not marshal klines: %w", err)
+		s.logger.Error("Failed to marshal klines", zap.Error(err))
+		return err
 	}
-
-	subject := s.cfg.NatsSubject
-	if subject == "" {
-		subject = "infosir_kline"
-	}
-
-	err = s.natsClient.Publish(subject, data)
-	if err != nil {
-		s.logger.Error("Failed to publish klines to NATS",
-			zap.String("subject", subject),
-			zap.Error(err),
-		)
-		return fmt.Errorf("could not publish klines: %w", err)
-	}
-
-	s.logger.Debug("Published klines to NATS",
-		zap.String("subject", subject),
-		zap.Int("count", len(klines)),
-	)
-	return nil
+	subject := s.cfg.Nats.NatsSubject
+	return s.natsClient.PublishJS(subject, data)
 }

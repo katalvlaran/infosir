@@ -1,6 +1,8 @@
 version: '3.9'
 
 services:
+
+
   # Сервис NATS
   nats:
     image: nats:2.9.19-alpine
@@ -44,3 +46,17 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+  timescaledb:
+    image: timescale/timescaledb:2.11.1-pg15
+    container_name: timescaledb
+    environment:
+      POSTGRES_PASSWORD: mysecret
+      POSTGRES_USER: myuser
+      POSTGRES_DB: mydb
+    ports:
+      - 5432:5432
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+volumes:
+  timescale_data:
