@@ -1,8 +1,8 @@
-version: "3.8"
+version: "3.9"
 
 services:
   db:
-    image: timescale/timescaledb:latest-pg14
+    image: timescale/timescaledb:2.19.0-pg14
     container_name: infosir_db
     restart: always
     ports:
@@ -14,9 +14,14 @@ services:
     # Optionally mount a volume for persistent storage
     volumes:
       - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U root"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   nats:
-    image: nats:2.9.17-alpine
+    image: nats:2.10.11
     container_name: infosir_nats
     restart: always
     ports:
@@ -25,11 +30,15 @@ services:
     command: ["-js"]  # enable JetStream
 
   infosir:
-    build: .
-    container_name: infosir_app
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: infosir_service
     depends_on:
-      - db
-      - nats
+      db:
+        condition: service_healthy
+      nats:
+        condition: service_started
     environment:
       # We override the config for DB here if needed
       DB_HOST: "db"
@@ -44,6 +53,7 @@ services:
       - "8080:8080"
     # Wait for DB and NATS to be ready if needed; can use a small script or service
     # For instance, we can rely on some wait-for-it if desired
+    restart: always
 
 volumes:
   db_data:
