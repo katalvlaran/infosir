@@ -2,13 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
+	"syscall"
 	"time"
-
-	"go.uber.org/zap"
 
 	"infosir/cmd/config"
 	"infosir/internal/db"
@@ -20,125 +22,108 @@ import (
 	natsinfosir "infosir/pkg/nats"
 )
 
-// main is the entry point of the infosir application.
 func main() {
-	// 1. Create a base context that we can cancel on OS interrupt
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// 2. Load configuration from environment variables or .env file
-	if err := config.LoadConfig(); err != nil {
-		fmt.Printf("Failed to load config: %v\n", err)
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	fmt.Printf("Loaded config: %s\n", config.Cfg.String())
-
-	// 3. Initialize a global logger
+}
+func run() error {
+	if err := config.LoadConfig(); err != nil {
+		return err
+	}
+	if _, err := srv.IntervalStart(time.Now(), config.Cfg.Crypto.KlineInterval); err != nil {
+		return err
+	}
 	utils.InitLogger()
-	defer utils.Logger.Sync() // flush logs on exit
-	utils.Logger.Info("Logger initialized",
-		zap.String("environment", config.Cfg.AppEnv),
-		zap.String("logLevel", config.Cfg.LogLevel),
-	)
-	files, _ := os.ReadDir("/app/migrations")
-	for _, f := range files {
-		fmt.Printf("Found migration file: %s\n", f.Name())
-	}
-
-	// 4. Initialize Database with migrations
-	dbPool, err := db.InitDatabase()
+	defer utils.Logger.Sync()
+	stopCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	startup, cancelStartup := context.WithTimeout(stopCtx, 30*time.Second)
+	defer cancelStartup()
+	pool, err := db.InitDatabaseContext(startup)
 	if err != nil {
-		utils.Logger.Fatal("Could not initialize DB with migrations", zap.Error(err))
+		return err
 	}
-	defer dbPool.Close()
-
-	utils.Logger.Info("Database connected & migrations completed",
-		zap.String("dbName", config.Cfg.Database.Name),
-	)
-
-	// 5. Initialize the repository
-	klineRepo := repository.NewKlineRepository(dbPool)
-
-	// 6. Initialize NATS + JetStream
+	defer pool.Close()
+	repo := repository.NewKlineRepository(pool)
+	if err = repo.BindProfile(startup, config.Cfg.Crypto.Market, config.Cfg.Crypto.KlineInterval, config.Cfg.ConfirmLegacyProfile); err != nil {
+		return err
+	}
 	nc, js, err := natsinfosir.InitNATSJetStream()
 	if err != nil {
-		utils.Logger.Fatal("Failed to init NATS JetStream", zap.Error(err))
+		return err
 	}
 	defer nc.Close()
-
-	utils.Logger.Info("Connected to NATS JetStream",
-		zap.String("stream", config.Cfg.NATS.StreamName),
-		zap.String("subject", config.Cfg.NATS.Subject),
-	)
-
-	// 7. Start the consumer that reads from JetStream and writes to DB
-	if err := natsinfosir.StartJetStreamConsumer(ctx, js, klineRepo); err != nil {
-		utils.Logger.Fatal("Failed to start JetStream consumer", zap.Error(err))
+	consumerCtx, cancelConsumer := context.WithCancel(context.Background())
+	defer cancelConsumer()
+	if err = natsinfosir.StartJetStreamConsumer(consumerCtx, js, repo); err != nil {
+		return err
 	}
-
-	// 8. Create real binance client & nats client
-	binanceClient := crypto.NewBinanceClient()
-	natsClient := natsinfosir.NewNatsJetStreamClient(js)
-
-	// 9. Create the InfoSir service
-	infoSirService := srv.NewInfoSirService(binanceClient, natsClient)
-
-	// 10. Possibly start the historical sync if enabled
+	client := crypto.NewBinanceClient()
+	service := srv.NewInfoSirService(client, natsinfosir.NewNatsJetStreamClient(js))
+	producerCtx, cancelProducers := context.WithCancel(stopCtx)
+	defer cancelProducers()
+	var wg sync.WaitGroup
+	failures := make(chan error, 2)
+	wg.Add(1)
+	go func() { defer wg.Done(); jobs.RunScheduledRequests(producerCtx, service, time.Minute) }()
 	if config.Cfg.SyncEnabled {
-		go jobs.RunHistoricalSync(ctx, klineRepo, binanceClient)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if e := jobs.RunHistoricalSyncChecked(producerCtx, repo, client); e != nil && !errors.Is(e, context.Canceled) {
+				failures <- fmt.Errorf("historical sync: %w", e)
+			}
+		}()
 	}
-
-	// 11. Start scheduled job to fetch/publish klines periodically
-	go jobs.RunScheduledRequests(ctx, infoSirService, time.Minute)
-
-	// 12. Start the HTTP server
-	httpSrv := startHTTPServer(infoSirService)
-
-	utils.Logger.Info("HTTP server started",
-		zap.Int("port", config.Cfg.HTTPPort),
-	)
-
-	// 13. Wait for interrupt signals to shut down gracefully
-	stopChan := make(chan os.Signal, 1)
-	signal.Notify(stopChan, os.Interrupt)
-	<-stopChan
-
-	utils.Logger.Info("Shutting down gracefully...")
-	cancel() // Cancel the main context
-
-	// 14. Attempt graceful shutdown of HTTP server
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer shutdownCancel()
-	if err := httpSrv.Shutdown(shutdownCtx); err != nil && err != http.ErrServerClosed {
-		utils.Logger.Error("Error shutting down HTTP server", zap.Error(err))
-	}
-
-	utils.Logger.Info("Service stopped. Goodbye!")
-}
-
-// startHTTPServer sets up the necessary endpoints, wraps them in a mux, and starts listening.
-func startHTTPServer(service srv.InfoSirService) *http.Server {
 	mux := http.NewServeMux()
-
-	// Example healthcheck
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("OK\n"))
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("alive\n")) })
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), time.Second)
+		defer cancel()
+		if !nc.IsConnected() || pool.Ping(ctx) != nil {
+			http.Error(w, "dependency unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = w.Write([]byte("dependencies ready; data completeness not asserted\n"))
 	})
-
-	// TODO: Register the orchestrator route if needed:
-	// mux.Handle("/orchestrator/fetch", handler.OrchestratorHandler(service, util.Logger))
-
-	srv := &http.Server{
-		Addr:    fmt.Sprintf(":%d", config.Cfg.HTTPPort),
-		Handler: mux,
-	}
-
+	httpSrv := &http.Server{Addr: fmt.Sprintf(":%d", config.Cfg.HTTPPort), Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, BaseContext: func(net.Listener) context.Context { return producerCtx }}
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			utils.Logger.Fatal("HTTP server crashed", zap.Error(err))
+		if e := httpSrv.ListenAndServe(); e != nil && !errors.Is(e, http.ErrServerClosed) {
+			failures <- e
 		}
 	}()
-
-	return srv
+	var failure error
+	select {
+	case <-stopCtx.Done():
+	case failure = <-failures:
+	}
+	cancelProducers()
+	shutdown, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	httpErr := httpSrv.Shutdown(shutdown)
+	if httpErr != nil {
+		_ = httpSrv.Close()
+	}
+	jobsDone := make(chan struct{})
+	go func() { wg.Wait(); close(jobsDone) }()
+	select {
+	case <-jobsDone:
+	case <-shutdown.Done():
+		return errors.Join(failure, httpErr, shutdown.Err())
+	}
+	// Consumers keep their independent context until all accepted callbacks drain.
+	drainErr := nc.Drain()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for !nc.IsClosed() {
+		select {
+		case <-ticker.C:
+		case <-shutdown.Done():
+			return errors.Join(failure, httpErr, drainErr, shutdown.Err())
+		}
+	}
+	cancelConsumer()
+	return errors.Join(failure, httpErr, drainErr)
 }

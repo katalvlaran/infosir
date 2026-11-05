@@ -2,6 +2,9 @@ package config
 
 import (
 	"fmt"
+	"net/url"
+	"strings"
+	"time"
 
 	"github.com/caarlos0/env/v11"
 	validation "github.com/go-ozzo/ozzo-validation"
@@ -26,11 +29,15 @@ type Config struct {
 	HTTPPort int `env:"HTTP_PORT" envDefault:"8080"`
 
 	// SyncEnabled toggles whether historical synchronization is run on startup.
-	SyncEnabled bool `env:"SYNC_ENABLED" envDefault:"true"`
+	SyncEnabled          bool   `env:"SYNC_ENABLED" envDefault:"false"`
+	SyncStart            string `env:"SYNC_START"`
+	ConfirmLegacyProfile bool   `env:"CONFIRM_LEGACY_PROFILE" envDefault:"false"`
 }
 
 // DatabaseConfig holds all the required DB connection parameters.
 type DatabaseConfig struct {
+	MigrationsPath string `env:"MIGRATIONS_PATH" envDefault:"internal/db/migrations"`
+	SSLMode        string `env:"DB_SSLMODE" envDefault:"disable"`
 	// Host is the hostname or IP of the Timescale/Postgres server (e.g. "localhost").
 	Host string `env:"DB_HOST" envDefault:"localhost"`
 	// Port is the port number for connecting to the database (e.g. 5432).
@@ -60,6 +67,7 @@ type NATSConfig struct {
 
 // CryptoConfig holds configuration for interacting with the Binance or other crypto APIs.
 type CryptoConfig struct {
+	Market string `env:"MARKET" envDefault:"spot"`
 	// BinanceBaseURL is the base endpoint for Binance REST calls, e.g. "https://api.binance.com"
 	BinanceBaseURL string `env:"BINANCE_BASE_URL" envDefault:"https://api.binance.com"`
 
@@ -78,16 +86,29 @@ type CryptoConfig struct {
 
 // Validate checks top-level config fields for correctness.
 func (c *Config) Validate() error {
+	if c.SyncStart != "" {
+		if _, err := time.Parse(time.RFC3339, c.SyncStart); err != nil {
+			return fmt.Errorf("invalid SYNC_START")
+		}
+	}
 	return validation.ValidateStruct(c,
-		validation.Field(&c.HTTPPort, validation.Required, validation.Min(1)),
+		validation.Field(&c.HTTPPort, validation.Required, validation.Min(1), validation.Max(65535)),
 	)
 }
 
 // Validate checks all DatabaseConfig fields for correctness.
 func (d DatabaseConfig) Validate() error {
+	switch d.SSLMode {
+	case "disable", "require", "verify-ca", "verify-full":
+	default:
+		return fmt.Errorf("invalid DB_SSLMODE")
+	}
+	if d.MigrationsPath == "" {
+		return fmt.Errorf("MIGRATIONS_PATH required")
+	}
 	return validation.ValidateStruct(&d,
 		validation.Field(&d.Host, validation.Required),
-		validation.Field(&d.Port, validation.Required, validation.Min(1)),
+		validation.Field(&d.Port, validation.Required, validation.Min(1), validation.Max(65535)),
 		validation.Field(&d.User, validation.Required),
 		validation.Field(&d.Password, validation.Required),
 		validation.Field(&d.Name, validation.Required),
@@ -96,6 +117,9 @@ func (d DatabaseConfig) Validate() error {
 
 // Validate checks NATS config fields for correctness.
 func (n NATSConfig) Validate() error {
+	if n.Subject == "" || strings.ContainsAny(n.Subject, "*> \t\r\n") {
+		return fmt.Errorf("NATS_SUBJECT must be a concrete subject")
+	}
 	return validation.ValidateStruct(&n,
 		validation.Field(&n.URL, validation.Required),
 		validation.Field(&n.StreamName, validation.Required),
@@ -105,11 +129,31 @@ func (n NATSConfig) Validate() error {
 
 // Validate checks crypto config fields for correctness.
 func (cc CryptoConfig) Validate() error {
+	if cc.Market == "usdm" && cc.KlineInterval == "1s" {
+		return fmt.Errorf("1s interval is unavailable for usdm")
+	}
+	if cc.KlineInterval == "3d" {
+		return fmt.Errorf("3d alignment needs a verified source calendar; unsupported by this release")
+	}
+	if cc.Market != "spot" && cc.Market != "usdm" {
+		return fmt.Errorf("MARKET must be spot or usdm")
+	}
+	expected := "api/v3/klines"
+	if cc.Market == "usdm" {
+		expected = "fapi/v1/klines"
+	}
+	if strings.Trim(cc.BinanceKlinesPoint, "/") != expected {
+		return fmt.Errorf("KLINES_POINT does not match MARKET")
+	}
+	u, err := url.Parse(cc.BinanceBaseURL)
+	if err != nil || u.User != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return fmt.Errorf("invalid source URL")
+	}
 	return validation.ValidateStruct(&cc,
 		validation.Field(&cc.BinanceBaseURL, validation.Required),
 		validation.Field(&cc.BinanceKlinesPoint, validation.Required),
 		validation.Field(&cc.Pairs, validation.Required, validation.Length(1, 0)),
-		validation.Field(&cc.KlineLimit, validation.Required, validation.Min(1)),
+		validation.Field(&cc.KlineLimit, validation.Required, validation.Min(1), validation.Max(1000)),
 	)
 }
 
@@ -121,6 +165,7 @@ func LoadConfig() error {
 		// Not necessarily fatal; we can log it. But let's just wrap it:
 		fmt.Printf("Warning: .env load error: %v\n", err)
 	}
+	Cfg = Config{}
 	if err := env.Parse(&Cfg); err != nil {
 		return fmt.Errorf("failed to parse environment variables: %w", err)
 	}
@@ -157,7 +202,7 @@ func (d DatabaseConfig) String() string {
 // String returns a debug-friendly representation of NATSConfig.
 func (n NATSConfig) String() string {
 	return fmt.Sprintf("NATSConfig{URL=%s,Subject=%s,StreamName=%s,ConsumerName=%s}",
-		n.URL, n.Subject, n.StreamName, n.ConsumerName)
+		"[redacted]", n.Subject, n.StreamName, n.ConsumerName)
 }
 
 // String returns a debug-friendly representation of CryptoConfig.

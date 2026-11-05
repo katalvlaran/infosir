@@ -1,9 +1,10 @@
 package models
 
 import (
+	"fmt"
+	"math"
+	"strings"
 	"time"
-
-	validation "github.com/go-ozzo/ozzo-validation"
 )
 
 // Kline represents a single candlestick (OHLCV) data point for a given symbol
@@ -36,17 +37,35 @@ type Kline struct {
 // Validate checks if the Kline struct fields are within acceptable ranges
 // (e.g., no negative prices or volumes). If anything is invalid, returns an error.
 func (k Kline) Validate() error {
-	return validation.ValidateStruct(&k,
-		validation.Field(&k.Time, validation.Required),
-		validation.Field(&k.Symbol, validation.Required),
-		validation.Field(&k.OpenPrice, validation.Required, validation.Min(0.0)),
-		validation.Field(&k.HighPrice, validation.Required, validation.Min(0.0)),
-		validation.Field(&k.LowPrice, validation.Required, validation.Min(0.0)),
-		validation.Field(&k.ClosePrice, validation.Required, validation.Min(0.0)),
-		validation.Field(&k.Volume, validation.Required, validation.Min(0.0)),
-		validation.Field(&k.QuoteVolume, validation.Required, validation.Min(0.0)),
-		validation.Field(&k.Trades, validation.Required, validation.Min(1)),
-		validation.Field(&k.TakerBuyBaseVolume, validation.Required, validation.Min(0.0)),
-		validation.Field(&k.TakerBuyQuoteVolume, validation.Required, validation.Min(0.0)),
-	)
+	if k.Time.IsZero() || k.Time.Year() < 1970 || k.Time.Year() > 9999 {
+		return fmt.Errorf("invalid kline time")
+	}
+	if k.Symbol == "" || k.Symbol != strings.TrimSpace(k.Symbol) || k.Symbol != strings.ToUpper(k.Symbol) {
+		return fmt.Errorf("invalid canonical symbol")
+	}
+	for _, r := range k.Symbol {
+		if !((r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_') {
+			return fmt.Errorf("invalid symbol character")
+		}
+	}
+	for _, v := range []float64{k.OpenPrice, k.HighPrice, k.LowPrice, k.ClosePrice} {
+		if math.IsNaN(v) || math.IsInf(v, 0) || v <= 0 {
+			return fmt.Errorf("invalid price")
+		}
+	}
+	if k.LowPrice > k.HighPrice || k.OpenPrice < k.LowPrice || k.OpenPrice > k.HighPrice || k.ClosePrice < k.LowPrice || k.ClosePrice > k.HighPrice {
+		return fmt.Errorf("inconsistent OHLC prices")
+	}
+	for _, v := range []float64{k.Volume, k.QuoteVolume, k.TakerBuyBaseVolume, k.TakerBuyQuoteVolume} {
+		if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
+			return fmt.Errorf("invalid volume")
+		}
+	}
+	if k.Trades < 0 {
+		return fmt.Errorf("negative trade count")
+	}
+	if k.TakerBuyBaseVolume > k.Volume || k.TakerBuyQuoteVolume > k.QuoteVolume {
+		return fmt.Errorf("taker volume exceeds total")
+	}
+	return nil
 }

@@ -1,86 +1,170 @@
 package nats
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"time"
 
 	"infosir/internal/db/repository"
 	"infosir/internal/models"
+	"infosir/internal/srv"
 	"infosir/internal/utils"
 
-	"github.com/nats-io/nats.go"
+	gonats "github.com/nats-io/nats.go"
 	"go.uber.org/zap"
 )
 
-// StartJetStreamConsumer sets up a durable consumer on the configured stream/subject
-// and processes messages by deserializing klines, then storing them in DB.
-func StartJetStreamConsumer(
-	ctx context.Context,
-	js nats.JetStreamContext,
-	klineRepo *repository.KlineRepository,
-) error {
-	subject := utils.GetConfig().NATS.Subject
-	durableName := utils.GetConfig().NATS.ConsumerName
+// MessageStore commits inbox and bars together; quarantine must be durable.
+type MessageStore interface {
+	CommitMessage(context.Context, string, string, []byte, []models.Kline) error
+	Quarantine(context.Context, string, string, string, []byte) error
+}
 
-	// We create a pull subscription or push subscription? Let's suppose push:
-	sub, err := js.Subscribe(subject, func(msg *nats.Msg) {
-		err := handleKlinesMsg(ctx, msg, klineRepo)
-		if err != nil {
-			utils.Logger.Error("handleKlinesMsg error", zap.Error(err))
-			// we can either NAK or let the message fail. For now let's Ack anyway.
+// Delivery makes acknowledgement ordering testable without a broker.
+type Delivery interface {
+	Payload() []byte
+	Header(string) string
+	Ack() error
+	Retry() error
+	Terminate() error
+}
+
+// ConsumerProfile is the immutable identity of one legacy storage database.
+type ConsumerProfile struct {
+	Consumer, Market, Interval string
+	Clock                      func() time.Time
+	FinalityLag                time.Duration
+}
+
+// ProcessDelivery acknowledges only a known committed transaction. Permanent
+// rejects are quarantined before termination; all storage errors cause retry.
+func ProcessDelivery(ctx context.Context, d Delivery, store MessageStore, p ConsumerProfile) error {
+	data := d.Payload()
+	id := d.Header(gonats.MsgIdHdr)
+	hash := sha256.Sum256(data)
+	if id == "" {
+		id = "missing:" + hex.EncodeToString(hash[:])
+	}
+	reject := func(reason string) error {
+		// Large payloads retain a digest and size, not an unbounded database blob.
+		raw := data
+		if len(raw) > 1<<20 {
+			raw = []byte(fmt.Sprintf("oversize bytes=%d sha256=%x", len(data), hash))
 		}
-		_ = msg.Ack() // ack to JetStream
-	}, nats.Durable(durableName), nats.ManualAck())
-	if err != nil {
-		return fmt.Errorf("js.Subscribe error: %w", err)
+		if err := store.Quarantine(ctx, p.Consumer, id, reason, raw); err != nil {
+			return errors.Join(err, d.Retry())
+		}
+		return d.Terminate()
 	}
-
-	utils.Logger.Info("JetStream consumer started",
-		zap.String("subject", subject),
-		zap.String("durableName", durableName),
-		zap.String("queue", ""), // if we used a queue group, specify
-	)
-
-	// Wait in a goroutine for context cancellation, unsub when done
-	go func() {
-		<-ctx.Done()
-		_ = sub.Unsubscribe()
-		utils.Logger.Info("Unsubscribed from JetStream consumer", zap.String("subject", subject))
-	}()
-
-	return nil
+	if len(data) > 1<<20 {
+		return reject("payload_too_large")
+	}
+	if d.Header("Infosir-Schema") != "1" || d.Header("Infosir-Market") != p.Market || d.Header("Infosir-Interval") != p.Interval || d.Header(gonats.MsgIdHdr) == "" {
+		return reject("invalid_envelope")
+	}
+	klines, err := decodeKlines(data)
+	if err != nil {
+		return reject("invalid_json")
+	}
+	if len(klines) == 0 || len(klines) > 1500 {
+		return reject("invalid_batch_size")
+	}
+	now := time.Now()
+	if p.Clock != nil {
+		now = p.Clock()
+	}
+	seen := make(map[string]struct{}, len(klines))
+	for _, k := range klines {
+		if err = k.Validate(); err != nil {
+			return reject("invalid_kline")
+		}
+		end, e := srv.NextOpen(k.Time, p.Interval)
+		if e != nil || end.After(now.Add(-p.FinalityLag)) {
+			return reject("unaligned_or_open_bar")
+		}
+		key := k.Symbol + "/" + k.Time.UTC().Format(time.RFC3339Nano)
+		if _, ok := seen[key]; ok {
+			return reject("duplicate_bar")
+		}
+		seen[key] = struct{}{}
+	}
+	if err = store.CommitMessage(ctx, p.Consumer, id, hash[:], klines); err != nil {
+		if errors.Is(err, repository.ErrPayloadConflict) {
+			return reject("payload_conflict")
+		}
+		return errors.Join(err, d.Retry())
+	}
+	return d.Ack()
 }
 
-// handleKlinesMsg handles a single NATS message, deserializing klines and writing them to DB.
-func handleKlinesMsg(
-	ctx context.Context,
-	msg *nats.Msg,
-	klineRepo *repository.KlineRepository,
-) error {
-	klines, err := decodeKlines(msg.Data)
+type brokerDelivery struct{ msg *gonats.Msg }
+
+func (d brokerDelivery) Payload() []byte        { return d.msg.Data }
+func (d brokerDelivery) Header(k string) string { return d.msg.Header.Get(k) }
+func (d brokerDelivery) Ack() error             { return d.msg.AckSync(gonats.AckWait(3 * time.Second)) }
+func (d brokerDelivery) Retry() error           { return d.msg.NakWithDelay(time.Second) }
+func (d brokerDelivery) Terminate() error       { return d.msg.Term() }
+
+// StartJetStreamConsumer uses explicit acknowledgement and bounded in-flight work.
+// The caller drains the NATS connection before cancelling ctx during shutdown.
+func StartJetStreamConsumer(ctx context.Context, js gonats.JetStreamContext, repo *repository.KlineRepository) error {
+	cfg := utils.GetConfig()
+	profile := ConsumerProfile{Consumer: cfg.NATS.ConsumerName, Market: cfg.Crypto.Market, Interval: cfg.Crypto.KlineInterval, FinalityLag: 2 * time.Second}
+	// Explicit creation plus Bind keeps the durable consumer across Drain/Unsubscribe.
+	info, err := js.ConsumerInfo(cfg.NATS.StreamName, cfg.NATS.ConsumerName)
+	if errors.Is(err, gonats.ErrConsumerNotFound) {
+		info, err = js.AddConsumer(cfg.NATS.StreamName, &gonats.ConsumerConfig{Durable: cfg.NATS.ConsumerName, DeliverSubject: gonats.NewInbox(), FilterSubject: cfg.NATS.Subject, AckPolicy: gonats.AckExplicitPolicy, AckWait: 30 * time.Second, MaxAckPending: 64})
+	}
 	if err != nil {
-		return fmt.Errorf("decodeKlines: %w", err)
+		return err
+	}
+	if err = validateConsumerConfig(info.Config, cfg.NATS.Subject, cfg.NATS.ConsumerName); err != nil {
+		return err
 	}
 
-	if len(klines) == 0 {
-		utils.Logger.Debug("Received empty klines array, ignoring.")
-		return nil
-	}
-
-	if err := klineRepo.BatchInsertKlines(ctx, klines); err != nil {
-		return fmt.Errorf("BatchInsertKlines: %w", err)
-	}
-
-	utils.Logger.Debug("Successfully inserted klines from message",
-		zap.Int("count", len(klines)))
-
-	return nil
+	_, err = js.Subscribe(cfg.NATS.Subject, func(msg *gonats.Msg) {
+		c, cancel := context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
+		if err := ProcessDelivery(c, brokerDelivery{msg}, repo, profile); err != nil {
+			utils.Logger.Error("message processing or acknowledgement failed", zap.Error(err))
+		}
+	}, gonats.Bind(cfg.NATS.StreamName, cfg.NATS.ConsumerName), gonats.ManualAck())
+	return err
 }
-
-// decodeKlines attempts to unmarshal JSON data into a slice of model.Kline.
 func decodeKlines(data []byte) ([]models.Kline, error) {
 	var klines []models.Kline
-	err := json.Unmarshal(data, &klines)
-	return klines, err
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&klines); err != nil {
+		return nil, err
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return nil, errors.New("trailing JSON")
+	}
+	return klines, nil
+}
+
+// validateConsumerConfig keeps delivery state durable and retries unbounded.
+// BackOff overrides AckWait on the server, so every interval must allow the
+// 20-second processing deadline plus the 3-second synchronous acknowledgement.
+func validateConsumerConfig(c gonats.ConsumerConfig, subject, durable string) error {
+	if c.Durable != durable || c.FilterSubject != subject || len(c.FilterSubjects) != 0 ||
+		c.DeliverSubject == "" || c.AckPolicy != gonats.AckExplicitPolicy ||
+		c.AckWait < 25*time.Second || c.MaxAckPending < 1 || c.MaxAckPending > 64 ||
+		c.MaxDeliver > 0 || c.MaxDeliver < -1 || c.InactiveThreshold != 0 || c.MemoryStorage {
+		return errors.New("consumer durability/retry profile differs; migrate explicitly")
+	}
+	for _, delay := range c.BackOff {
+		if delay < 25*time.Second {
+			return errors.New("consumer backoff is shorter than processing deadline; migrate explicitly")
+		}
+	}
+	return nil
 }

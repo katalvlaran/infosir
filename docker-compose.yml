@@ -1,59 +1,48 @@
-version: "3.9"
-
+# Development only. Supply DB_PASS and NATS_TOKEN at runtime; no embedded credentials.
 services:
   db:
     image: timescale/timescaledb:2.19.0-pg14
-    container_name: infosir_db
-    restart: always
-    ports:
-      - "5432:5432"
     environment:
-      POSTGRES_DB: "infosir_db"
-      POSTGRES_USER: "root"
-      POSTGRES_PASSWORD: "secret"
-    # Optionally mount a volume for persistent storage
+      POSTGRES_DB: infosir_db
+      POSTGRES_USER: infosir
+      POSTGRES_PASSWORD: ${DB_PASS:?set DB_PASS}
     volumes:
       - db_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U root"]
+      test: ["CMD-SHELL", "pg_isready -U infosir -d infosir_db"]
       interval: 5s
       timeout: 5s
-      retries: 5
-
+      retries: 10
   nats:
     image: nats:2.10.11
-    container_name: infosir_nats
-    restart: always
-    ports:
-      - "4222:4222"
-      - "8222:8222"
-    command: ["-js"]  # enable JetStream
-
+    command: ["-js", "-sd", "/data", "--auth", "${NATS_TOKEN:?set NATS_TOKEN}"]
+    volumes:
+      - nats_data:/data
   infosir:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: infosir_service
+    build: .
     depends_on:
       db:
         condition: service_healthy
       nats:
         condition: service_started
     environment:
-      # We override the config for DB here if needed
-      DB_HOST: "db"
+      DB_HOST: db
       DB_PORT: "5432"
-      DB_USER: "root"
-      DB_PASS: "secret"
-      DB_NAME: "infosir_db"
-
-      NATS_URL: "nats://nats:4222"
-      # You may also set KLINES_POINT, BINANCE_BASE_URL, etc.
+      DB_USER: infosir
+      DB_PASS: ${DB_PASS:?set DB_PASS}
+      DB_NAME: infosir_db
+      NATS_URL: nats://${NATS_TOKEN:?set NATS_TOKEN}@nats:4222
+      MARKET: ${MARKET:-spot}
+      BINANCE_BASE_URL: ${BINANCE_BASE_URL:-https://api.binance.com}
+      KLINES_POINT: ${KLINES_POINT:-api/v3/klines}
+      PAIRS: ${PAIRS:-BTCUSDT}
+      KLINE_INTERVAL: ${KLINE_INTERVAL:-1m}
+      SYNC_ENABLED: ${SYNC_ENABLED:-false}
+      SYNC_START: ${SYNC_START:-}
+      CONFIRM_LEGACY_PROFILE: ${CONFIRM_LEGACY_PROFILE:-false}
     ports:
-      - "8080:8080"
-    # Wait for DB and NATS to be ready if needed; can use a small script or service
-    # For instance, we can rely on some wait-for-it if desired
-    restart: always
-
+      - "127.0.0.1:8080:8080"
+    stop_grace_period: 30s
 volumes:
   db_data:
+  nats_data:

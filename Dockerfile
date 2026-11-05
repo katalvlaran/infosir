@@ -1,33 +1,15 @@
 FROM golang:1.23-alpine AS builder
-LABEL authors="katalvlaran"
-WORKDIR /app
-
-# Copy go.mod and go.sum first to take advantage of layer caching
+WORKDIR /src
 COPY go.mod go.sum ./
-
-# Download modules
 RUN go mod download
-
-# Copy everything else
 COPY . .
-
-# Build the binary
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o infosir ./cmd/main.go
-
-# Final stage
-FROM alpine:3.17
+RUN CGO_ENABLED=0 go build -trimpath -o /infosir ./cmd
+FROM alpine:3.22
+RUN apk add --no-cache ca-certificates && adduser -D -u 10001 app
 WORKDIR /app
-
-# Copy the compiled binary, migrations and .env
-COPY --from=builder /app/infosir /app/infosir
-COPY --from=builder /app/internal/db/migrations /app/migrations
-COPY .env /app/.env
-
-# Expose the configured port, default 8080
+COPY --from=builder /infosir /app/infosir
+COPY internal/db/migrations /app/migrations
+ENV MIGRATIONS_PATH=/app/migrations
+USER 10001:10001
 EXPOSE 8080
-
-# Set working directory explicitly (important!)
-WORKDIR /app
-
-# Default entrypoint
 ENTRYPOINT ["/app/infosir"]

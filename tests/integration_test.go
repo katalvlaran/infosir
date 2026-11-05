@@ -2,111 +2,129 @@ package tests
 
 import (
 	"context"
-	"database/sql"
+	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
-	"infosir/cmd/config"
-	"infosir/internal/db"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"infosir/internal/db/repository"
 	"infosir/internal/models"
-	"infosir/internal/utils"
-
-	_ "github.com/lib/pq" // example: if we do a direct DB test
-	"github.com/stretchr/testify/assert"
 )
 
-// TestIntegration_DatabaseInsert is a pseudo-integration test that checks if we
-// can actually insert and retrieve klines from a real or test database.
-func TestIntegration_DatabaseInsert(t *testing.T) {
-	// 1. Possibly load config if not already done
-	err := config.LoadConfig()
-	if err != nil {
-		t.Fatalf("Failed to load config: %v", err)
+// TestRepositoryAtomicity uses only an explicitly supplied disposable database.
+// Its isolated schema emulates the legacy base table without Timescale aggregates.
+func TestRepositoryAtomicity(t *testing.T) {
+	dsn := os.Getenv("INFOSIR_TEST_DSN")
+	if dsn == "" {
+		t.Skip("set INFOSIR_TEST_DSN to a disposable PostgreSQL database")
 	}
-
-	// 2. Initialize logger (or do once in a TestMain)
-	utils.InitLogger()
-
-	// 3. Connect to DB
-	dbPool, err := db.InitDatabase()
-	if err != nil {
-		t.Fatalf("Cannot init DB: %v", err)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	admin, e := pgxpool.New(ctx, dsn)
+	if e != nil {
+		t.Fatal(e)
 	}
-	defer dbPool.Close()
-
-	// 4. Create the repository
-	kRepo := repository.NewKlineRepository(dbPool)
-
-	openTime, err := time.Parse("2006-01-02T15:04:05Z", "2024-01-02T15:04:05Z")
-	if err != nil {
-		t.Fatalf("parse time: %v", err)
+	defer admin.Close()
+	schema := fmt.Sprintf("infosir_test_%d", time.Now().UnixNano())
+	if _, e = admin.Exec(ctx, "CREATE SCHEMA "+schema); e != nil {
+		t.Fatal(e)
 	}
-	// 5. Insert a kline
-	testKline := models.Kline{
-		Symbol:              "TESTPAIR",
-		Time:                openTime,
-		OpenPrice:           123.45,
-		HighPrice:           130.00,
-		LowPrice:            120.11,
-		ClosePrice:          128.00,
-		Volume:              123.456,
-		QuoteVolume:         999.999,
-		Trades:              456,
-		TakerBuyBaseVolume:  50.0,
-		TakerBuyQuoteVolume: 60.0,
+	defer func() {
+		c, stop := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stop()
+		if _, e := admin.Exec(c, "DROP SCHEMA "+schema+" CASCADE"); e != nil {
+			t.Error(e)
+		}
+	}()
+	cfg, e := pgxpool.ParseConfig(dsn)
+	if e != nil {
+		t.Fatal(e)
 	}
-
-	ctx := context.Background()
-	err = kRepo.InsertKline(ctx, testKline)
-	assert.NoError(t, err, "InsertKline should succeed")
-
-	// 6. Retrieve the last kline for "TESTPAIR"
-	retrieved, err := kRepo.FindLast(ctx, "testpair") // note the lowercase, if you store symbol in lower
-	assert.NoError(t, err, "FindLast should succeed")
-	assert.Equal(t, testKline.ClosePrice, retrieved.ClosePrice, "ClosePrice mismatch")
-	assert.Equal(t, testKline.Trades, retrieved.Trades, "Trades mismatch")
-}
-
-// TestIntegration_Connection ensures DB migrations are done properly
-func TestIntegration_Connection(t *testing.T) {
-	// Possibly you want to check that the table "futures_klines" is created, etc.
-	dsn := fmt.Sprintf(
-		"postgres://%s:%s@%s:%d/%s?sslmode=disable",
-		config.Cfg.Database.User,
-		config.Cfg.Database.Password,
-		config.Cfg.Database.Host,
-		config.Cfg.Database.Port,
-		config.Cfg.Database.Name,
-	)
-
-	dbConn, err := sql.Open("postgres", dsn)
-	if err != nil {
-		t.Fatalf("Failed to open raw DB conn: %v", err)
+	cfg.ConnConfig.RuntimeParams["search_path"] = schema
+	pool, e := pgxpool.NewWithConfig(ctx, cfg)
+	if e != nil {
+		t.Fatal(e)
 	}
-	defer dbConn.Close()
-
-	// ping
-	err = dbConn.Ping()
-	assert.NoError(t, err, "Ping to DB should succeed")
-
-	// check if table "futures_klines" exists
-	var tableName string
-	err = dbConn.QueryRow(`
-		SELECT tablename
-		FROM pg_catalog.pg_tables
-		WHERE tablename = 'futures_klines';
-	`).Scan(&tableName)
-
-	assert.NoError(t, err, "Should find futures_klines in pg_tables")
-	assert.Equal(t, "futures_klines", tableName, "Table name mismatch")
-}
-
-// Optionally we can define a TestMain() for integration tests set up
-func TestMain(m *testing.M) {
-	// e.g. do some start up or docker container management
-	code := m.Run()
-	os.Exit(code)
+	defer pool.Close()
+	_, e = pool.Exec(ctx, `CREATE TABLE futures_klines(time timestamptz NOT NULL,symbol text NOT NULL CHECK(symbol<>'FAIL'),open_price double precision,high_price double precision,low_price double precision,close_price double precision,volume double precision,quote_volume double precision,trades bigint,taker_buy_base_volume double precision,taker_buy_quote_volume double precision,PRIMARY KEY(symbol,time))`)
+	if e != nil {
+		t.Fatal(e)
+	}
+	migration, e := os.ReadFile(filepath.Join("..", "internal", "db", "migrations", "0003_ingestion_receipts.up.sql"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	if _, e = pool.Exec(ctx, string(migration)); e != nil {
+		t.Fatal(e)
+	}
+	repo := repository.NewKlineRepository(pool)
+	k := models.Kline{Time: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC), Symbol: "BTCUSDT", OpenPrice: 1, HighPrice: 1, LowPrice: 1, ClosePrice: 1}
+	if e = repo.InsertKline(ctx, k); e != nil {
+		t.Fatal(e)
+	}
+	if e = repo.BindProfile(ctx, "spot", "1m", false); !errors.Is(e, repository.ErrStorageProfile) {
+		t.Fatalf("unverified history accepted: %v", e)
+	}
+	if e = repo.BindProfile(ctx, "spot", "1m", true); e != nil {
+		t.Fatal(e)
+	}
+	if e = repo.BindProfile(ctx, "usdm", "1m", true); !errors.Is(e, repository.ErrStorageProfile) {
+		t.Fatalf("profile collision: %v", e)
+	}
+	got, e := repo.FindLast(ctx, " btcusdt ")
+	if e != nil || got.Symbol != k.Symbol {
+		t.Fatalf("canonical lookup %v %v", got, e)
+	}
+	h := sha256.Sum256([]byte("delivery"))
+	k.Time = k.Time.Add(time.Minute)
+	var wg sync.WaitGroup
+	errs := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); errs <- repo.CommitMessage(ctx, "consumer", "same", h[:], []models.Kline{k}) }()
+	}
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		if e != nil {
+			t.Fatal(e)
+		}
+	}
+	var n int
+	if e = pool.QueryRow(ctx, "SELECT count(*) FROM futures_klines").Scan(&n); e != nil || n != 2 {
+		t.Fatalf("dedup rows=%d err=%v", n, e)
+	}
+	changed := sha256.Sum256([]byte("changed"))
+	if e = repo.CommitMessage(ctx, "consumer", "same", changed[:], []models.Kline{k}); !errors.Is(e, repository.ErrPayloadConflict) {
+		t.Fatalf("hash collision accepted %v", e)
+	}
+	good := k
+	good.Time = good.Time.Add(time.Minute)
+	bad := good
+	bad.Symbol = "FAIL"
+	if e = repo.CommitMessage(ctx, "consumer", "rollback", h[:], []models.Kline{good, bad}); e == nil {
+		t.Fatal("expected second-row database constraint failure")
+	}
+	if e = pool.QueryRow(ctx, "SELECT count(*) FROM futures_klines").Scan(&n); e != nil || n != 2 {
+		t.Fatalf("partial batch persisted %d %v", n, e)
+	}
+	if e = pool.QueryRow(ctx, "SELECT count(*) FROM infosir_consumer_inbox WHERE event_id='rollback'").Scan(&n); e != nil || n != 0 {
+		t.Fatalf("inbox survived rollback %d %v", n, e)
+	}
+	if e = repo.CommitMessage(ctx, "consumer", "rollback", h[:], []models.Kline{good}); e != nil {
+		t.Fatalf("retry failed %v", e)
+	}
+	for i := 0; i < 2; i++ {
+		if e = repo.Quarantine(ctx, "c", "id", "invalid_json", []byte("bad")); e != nil {
+			t.Fatal(e)
+		}
+	}
+	if e = pool.QueryRow(ctx, "SELECT count(*) FROM infosir_quarantine").Scan(&n); e != nil || n != 1 {
+		t.Fatalf("quarantine dedup %d %v", n, e)
+	}
 }

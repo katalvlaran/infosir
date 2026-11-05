@@ -2,63 +2,75 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
+	"net/url"
+	"path/filepath"
+	"strconv"
+	"time"
 
 	"infosir/cmd/config"
-	"infosir/internal/utils"
 
 	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/postgres"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"go.uber.org/zap"
 )
 
-// InitDatabase connects to Timescale/PostgreSQL, applies migrations, and returns a usable pgx pool.
+// InitDatabase preserves the original entry point with bounded startup.
 func InitDatabase() (*pgxpool.Pool, error) {
-	dsn := fmt.Sprintf(
-		"postgres://%s:%s@%s:%d/%s?sslmode=disable",
-		config.Cfg.Database.User,
-		config.Cfg.Database.Password,
-		config.Cfg.Database.Host,
-		config.Cfg.Database.Port,
-		config.Cfg.Database.Name,
-	)
-
-	dbPool, err := pgxpool.New(context.Background(), dsn)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create pgx pool: %w", err)
-	}
-
-	if err := dbPool.Ping(context.Background()); err != nil {
-		return nil, fmt.Errorf("failed to ping database: %w", err)
-	}
-
-	utils.Logger.Info("Connected to TimescaleDB",
-		zap.String("host", config.Cfg.Database.Host),
-		zap.Int("port", config.Cfg.Database.Port),
-		zap.String("database", config.Cfg.Database.Name),
-	)
-
-	if err := runMigrations(dsn); err != nil {
-		return nil, fmt.Errorf("failed to run DB migrations: %w", err)
-	}
-
-	return dbPool, nil
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return InitDatabaseContext(ctx)
 }
 
-// runMigrations runs schema migrations from the migrations directory.
-func runMigrations(dsn string) error {
-	m, err := migrate.New("file://migrations", dsn)
+// InitDatabaseContext opens the pool and applies the configured Timescale migrations.
+func InitDatabaseContext(ctx context.Context) (*pgxpool.Pool, error) {
+	c := config.Cfg.Database
+	u := url.URL{Scheme: "postgres", User: url.UserPassword(c.User, c.Password), Host: net.JoinHostPort(c.Host, strconv.Itoa(c.Port)), Path: "/" + c.Name}
+	q := u.Query()
+	q.Set("sslmode", c.SSLMode)
+	q.Set("connect_timeout", "5")
+	q.Set("statement_timeout", "20000")
+	u.RawQuery = q.Encode()
+	pool, err := pgxpool.New(ctx, u.String())
 	if err != nil {
-		return fmt.Errorf("migrate.New: %w", err)
+		return nil, errors.New("invalid database configuration")
 	}
-
+	success := false
+	defer func() {
+		if !success {
+			pool.Close()
+		}
+	}()
+	if err = pool.Ping(ctx); err != nil {
+		return nil, errors.New("database connection failed")
+	}
+	if err = runMigrations(u.String()); err != nil {
+		return nil, fmt.Errorf("database migration: %w", err)
+	}
+	if err = ctx.Err(); err != nil {
+		return nil, err
+	}
+	success = true
+	return pool, nil
+}
+func runMigrations(dsn string) error {
+	path, err := filepath.Abs(config.Cfg.Database.MigrationsPath)
+	if err != nil {
+		return err
+	}
+	source := url.URL{Scheme: "file", Path: path}
+	m, err := migrate.New(source.String(), dsn)
+	if err != nil {
+		return errors.New("cannot open migration source or database")
+	}
+	m.LockTimeout = 10 * time.Second
 	err = m.Up()
-	if err != nil && err != migrate.ErrNoChange {
-		return fmt.Errorf("migrate.Up: %w", err)
+	if errors.Is(err, migrate.ErrNoChange) {
+		err = nil
 	}
-
-	utils.Logger.Info("Database migrations applied successfully")
-	return nil
+	sourceErr, dbErr := m.Close()
+	return errors.Join(err, sourceErr, dbErr)
 }
